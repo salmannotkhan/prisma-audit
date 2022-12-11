@@ -12,6 +12,8 @@ function fetchUser(token: string) {
 }
 const userContext = new AsyncLocalStorage<string>()
 const prisma = new PrismaClient()
+
+// Auditing middleware
 prisma.$use(async (params, next) => {
   const { action, model, args } = params
   const actionMap: Record<string, string> = {
@@ -23,161 +25,82 @@ prisma.$use(async (params, next) => {
     'delete': "deleted",
     'deleteMany': "deleted",
   }
-  const user = userContext.getStore()
-  await next(params)
-  console.log(new Date().toISOString())
-  console.log(user, actionMap[action], model, "with", args)
+  if (action in actionMap) {
+    const user = userContext.getStore()
+    const result = await next(params)
+    console.log("Timestamp:", new Date().toISOString())
+    let actionString
+    const data = JSON.stringify(args.data)
+    const where = JSON.stringify(args.where)
+    if (actionMap[action] === "updated") {
+      actionString = `with ${data} where ${where}`
+    } else if (actionMap[action] === "deleted") {
+      actionString = `where ${where}`
+    } else {
+      actionString = `with ${data}`
+    }
+    console.log(user, actionMap[action], model, actionString)
+    console.log()
+    return result
+  } 
+  return next(params)
 })
 
 const app = express()
 app.use(express.json())
+
+// Attaching User Context
 app.use((req, _res, next) => {
-  const token = req.headers.authorization?.split(" ")[1] || ""
-  const user = fetchUser(token)
-  userContext.run(user, () => next())
+  if ("authorization" in req.headers) {
+    const token = req.headers.authorization?.split(" ")[1] || ""
+    const user = fetchUser(token)
+    userContext.run(user, () => next())
+    return
+  }
+  next()
 })
 
-app.post(`/signup`, async (req, res) => {
-  const { name, email, posts } = req.body
-
-  const postData = posts?.map((post: Prisma.PostCreateInput) => {
-    return { title: post?.title, content: post?.content }
-  })
+app.post(`/users`, async (req, res) => {
+  const { name, email} = req.body
 
   const result = await prisma.user.create({
     data: {
       name,
       email,
-      posts: {
-        create: postData,
-      },
     },
   })
-  res.json(result)
+  return res.status(201).json(result)
 })
 
-app.post(`/post`, async (req, res) => {
-  const { title, content, authorEmail } = req.body
-  const result = await prisma.post.create({
+app.patch('/users/:id', async (req, res) =>{
+  const { id } = req.params
+  const { name, email} = req.body
+
+  const result = await prisma.user.update({
+    where: { id: Number(id) },
     data: {
-      title,
-      content,
-      author: { connect: { email: authorEmail } },
+      name,
+      email,
     },
   })
-  res.json(result)
+  return res.status(200).json(result)
 })
 
-app.put('/post/:id/views', async (req, res) => {
+app.delete('/users/:id', async (req, res) => {
   const { id } = req.params
-
-  try {
-    const post = await prisma.post.update({
-      where: { id: Number(id) },
-      data: {
-        viewCount: {
-          increment: 1,
-        },
-      },
-    })
-
-    res.json(post)
-  } catch (error) {
-    res.json({ error: `Post with ID ${id} does not exist in the database` })
-  }
-})
-
-app.put('/publish/:id', async (req, res) => {
-  const { id } = req.params
-
-  try {
-    const postData = await prisma.post.findUnique({
-      where: { id: Number(id) },
-      select: {
-        published: true,
-      },
-    })
-
-    const updatedPost = await prisma.post.update({
-      where: { id: Number(id) || undefined },
-      data: { published: !postData?.published },
-    })
-    res.json(updatedPost)
-  } catch (error) {
-    res.json({ error: `Post with ID ${id} does not exist in the database` })
-  }
-})
-
-app.delete(`/post/:id`, async (req, res) => {
-  const { id } = req.params
-  const post = await prisma.post.delete({
-    where: {
-      id: Number(id),
-    },
+  const users = await prisma.user.delete({
+    where: { id: Number(id) }
   })
-  res.json(post)
+  return res.status(200).json(users)
 })
 
 app.get('/users', async (_req, res) => {
   const users = await prisma.user.findMany()
-  res.json(users)
+  console.log(users)
+  return res.status(200).json(users)
 })
 
-app.get('/user/:id/drafts', async (req, res) => {
-  const { id } = req.params
 
-  const drafts = await prisma.user
-    .findUnique({
-      where: {
-        id: Number(id),
-      },
-    })
-    .posts({
-      where: { published: false },
-    })
-
-  res.json(drafts)
-})
-
-app.get(`/post/:id`, async (req, res) => {
-  const { id }: { id?: string } = req.params
-
-  const post = await prisma.post.findUnique({
-    where: { id: Number(id) },
-  })
-  res.json(post)
-})
-
-app.get('/feed', async (req, res) => {
-  const { searchString, skip, take, orderBy } = req.query
-
-  const or: Prisma.PostWhereInput = searchString
-    ? {
-        OR: [
-          { title: { contains: searchString as string } },
-          { content: { contains: searchString as string } },
-        ],
-      }
-    : {}
-
-  const posts = await prisma.post.findMany({
-    where: {
-      published: true,
-      ...or,
-    },
-    include: { author: true },
-    take: Number(take) || undefined,
-    skip: Number(skip) || undefined,
-    orderBy: {
-      updatedAt: orderBy as Prisma.SortOrder,
-    },
-  })
-
-  res.json(posts)
-})
-
-const server = app.listen(3000, () =>
-  console.log(`
-🚀 Server ready at: http://localhost:3000
-⭐️ See sample requests: http://pris.ly/e/ts/rest-express#3-using-the-rest-api`),
+app.listen(3000, () =>
+  console.log(`🚀 Server ready at: http://localhost:3000`)
 )
